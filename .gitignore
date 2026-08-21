@@ -1,0 +1,31 @@
+# Environment & Secrets (Strix SEC-01)
+.env
+.env.local
+*.pem
+*.key
+
+# Database & SQLite
+state.db
+state.db-wal
+state.db-shm
+*.db
+*.sqlite3
+
+# Logs & Metrics
+*.log
+bot.log*
+
+# Python cache & Venv
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Temp Media & Audio
+temp/
+*.ogg
+*.mp3
+*.wav
+*.png
+*.jpg
