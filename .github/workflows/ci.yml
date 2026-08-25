@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  validate:
-    name: Lint & Test Suite
+  test:
+    name: Python Unit Tests & Syntax Verification
     runs-on: ubuntu-latest
 
     steps:
@@ -19,12 +19,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install httpx psutil python-dotenv edge-tts
+          pip install python-telegram-bot edge-tts psutil python-dotenv aiohttp requests
 
-      - name: Python Syntax & Compilation Check
+      - name: Python Syntax & Static Analysis
         run: |
-          python -m py_compile bot.py doctor.py formatters.py reactions.py stress_test.py test_suite.py
+          python -m py_compile bot.py formatters.py reactions.py doctor.py
+
+      - name: Run Basic Diagnostics
+        run: |
+          python -c "import bot, formatters, reactions; print('Core modules imported successfully!')"

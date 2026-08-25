@@ -217,7 +217,13 @@ class StateDB:
                 "agent_mode": "build"
             }
 
-    def set_voice_enabled(self, chat_id: int, topic_id: Optional[int], enabled: bool):
+    def get_user_settings(self, chat_id: int, topic_id: Optional[int] = None) -> dict:
+        return self.get_settings(chat_id, topic_id)
+
+    def set_voice_enabled(self, chat_id: int, topic_id: Optional[int] = None, enabled: bool = True):
+        if isinstance(topic_id, bool):
+            enabled = topic_id
+            topic_id = None
         scope_key = self._get_scope_key(chat_id, topic_id)
         with self._get_conn() as conn:
             conn.execute("""
@@ -227,7 +233,7 @@ class StateDB:
             """, (scope_key, int(enabled), time.time()))
             conn.commit()
 
-    def set_model(self, chat_id: int, topic_id: Optional[int], model: str):
+    def set_model(self, chat_id: int, topic_id: Optional[int] = None, model: str = "auto"):
         scope_key = self._get_scope_key(chat_id, topic_id)
         with self._get_conn() as conn:
             conn.execute("""
@@ -237,7 +243,7 @@ class StateDB:
             """, (scope_key, model, time.time()))
             conn.commit()
 
-    def set_agent_mode(self, chat_id: int, topic_id: Optional[int], mode: str):
+    def set_agent_mode(self, chat_id: int, topic_id: Optional[int] = None, mode: str = "build"):
         scope_key = self._get_scope_key(chat_id, topic_id)
         with self._get_conn() as conn:
             conn.execute("""
@@ -247,7 +253,7 @@ class StateDB:
             """, (scope_key, mode, time.time()))
             conn.commit()
 
-    def set_workspace(self, chat_id: int, topic_id: Optional[int], workspace: Path):
+    def set_workspace(self, chat_id: int, topic_id: Optional[int] = None, workspace: Path = DEFAULT_WORKSPACE):
         scope_key = self._get_scope_key(chat_id, topic_id)
         with self._get_conn() as conn:
             conn.execute("""
@@ -257,7 +263,7 @@ class StateDB:
             """, (scope_key, str(workspace), time.time()))
             conn.commit()
 
-    def record_metric(self, chat_id: int, command_type: str, duration_sec: float, success: bool, rss_mb: float, prompt_summary: str = ""):
+    def record_metric(self, chat_id: int, command_type: str, duration_sec: float, success: bool, rss_mb: float = 0.0, prompt_summary: str = ""):
         try:
             with self._get_conn() as conn:
                 conn.execute(
