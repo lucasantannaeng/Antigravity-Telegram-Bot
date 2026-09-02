@@ -1,4 +1,4 @@
-# 🌌 Antigravity Telegram Bot v6.1 (Ultimate Edition)
+# 🌌 Antigravity Telegram Bot v6.1
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-2CA5E0?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
