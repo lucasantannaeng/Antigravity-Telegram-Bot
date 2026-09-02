@@ -29,3 +29,74 @@ temp/
 *.wav
 *.png
 *.jpg
+
+# =============================================================================
+# DevSecOps: Desktop Compilations, Binaries & Secret Protection (Zero-Trust)
+# =============================================================================
+# Environment & Secret Files (Prevents API key leaks)
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+*.cert
+*.pfx
+*.p12
+credentials.json
+service-account*.json
+
+# Desktop Application Compilations & Builds (Electron / Tauri / PyInstaller)
+release/
+release_builds/
+dist-electron/
+win-unpacked/
+mac/
+linux/
+*.builder.cache/
+*.exe
+*.asar
+*.dmg
+*.apk
+*.aab
+*.msi
+*.app
+*.blockmap
+latest.yml
+latest-*.yml
+builder-debug.yml
+builder-effective-config.yaml
+
+# Web & General Build Outputs
+dist/
+dist-ssr/
+build/
+out/
+.output/
+.vite/
+.cache/
+
+# Dependencies & Package Managers
+node_modules/
+.pnpm-store/
+.yarn/
+__pycache__/
+*.pyc
+
+# IDEs & OS Files
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+# Archives & Bundles
+*.zip
+*.7z
+*.tar.gz
+*.rar
