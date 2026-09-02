@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "state.db"
 
 
-async def run_doctor_audit(bot_token: str, groq_key: str, gemini_key: str, workspace: Path) -> dict:
+async def run_doctor_audit(bot_token: str, groq_key: str, gemini_key: str, workspace: Path, freellm_key: str = "", freellm_base_url: str = "") -> dict:
     """Executes a full diagnostic health check of all subsystems."""
     results = {}
 
@@ -107,18 +107,44 @@ async def run_doctor_audit(bot_token: str, groq_key: str, gemini_key: str, works
     except Exception as e:
         results["sqlite_db"] = {"ok": False, "info": f"Erro BD: {e}"}
 
-    # 7. Hardware & Host Resources
+    # 7. FreeLLM Local Proxy
+    f_key = freellm_key or os.getenv("FREE_LLM_API_KEY") or os.getenv("FREELLM_API_KEY", "")
+    f_url = (freellm_base_url or os.getenv("FREE_LLM_BASE_URL") or os.getenv("FREELLM_BASE_URL", "http://127.0.0.1:31415/v1")).rstrip("/")
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(f"{f_url}/models", headers={"Authorization": f"Bearer {f_key}"})
+            f_lat = round((time.time() - t0) * 1000, 1)
+            if resp.status_code == 200:
+                data = resp.json()
+                count = len(data.get("data", []))
+                results["freellm_proxy"] = {
+                    "ok": True,
+                    "latency_ms": f_lat,
+                    "info": f"Online ({count} modelos, {f_lat}ms)"
+                }
+            else:
+                results["freellm_proxy"] = {
+                    "ok": False,
+                    "info": f"HTTP {resp.status_code} (Chave inválida ou erro)"
+                }
+    except Exception as e:
+        results["freellm_proxy"] = {"ok": False, "info": f"Offline ou inacessível: {e}"}
+
+    # 8. Hardware & Host Resources
     ram = psutil.virtual_memory()
     disk_d = psutil.disk_usage(r"D:\\") if os.path.exists(r"D:\\") else psutil.disk_usage(r"C:\\")
     proc = psutil.Process(os.getpid())
+    daemon_rss_mb = round(proc.memory_info().rss / (1024 * 1024), 2)
 
     results["resources"] = {
-        "ok": ram.available > (500 * 1024 * 1024),
+        "ok": ram.available > (500 * 1024 * 1024) and daemon_rss_mb < 80.0,
         "host_cpu": f"{psutil.cpu_percent()}%",
         "host_ram": f"{round(ram.used/(1024**3), 2)}/{round(ram.total/(1024**3), 2)} GB ({ram.percent}%)",
         "host_ram_free": f"{round(ram.available/(1024**3), 2)} GB livres",
         "disk_free": f"{round(disk_d.free/(1024**3), 2)} GB livres",
-        "daemon_rss": f"{round(proc.memory_info().rss/(1024*1024), 2)} MB",
+        "daemon_rss": f"{daemon_rss_mb} MB (<80MB limite)",
+        "daemon_rss_mb": daemon_rss_mb,
         "threads": proc.num_threads()
     }
 
@@ -134,6 +160,8 @@ def format_doctor_report(audit: dict) -> str:
     lines.append(f"{_badge(audit['telegram_api']['ok'])} **Telegram API:** `{audit['telegram_api']['info']}`")
     lines.append(f"{_badge(audit['antigravity_cli']['ok'])} **Antigravity CLI (`agy`):** `{audit['antigravity_cli']['info']}`")
     lines.append(f"{_badge(audit['hermes_agent']['ok'])} **Hermes Agent:** `{audit['hermes_agent']['info']}`")
+    if "freellm_proxy" in audit:
+        lines.append(f"{_badge(audit['freellm_proxy']['ok'])} **FreeLLM Local Proxy:** `{audit['freellm_proxy']['info']}`")
     lines.append(f"{_badge(audit['stt_engine']['ok'])} **Áudio STT:** `{audit['stt_engine']['info']}`")
     lines.append(f"{_badge(audit['tts_engine']['ok'])} **Áudio TTS:** `{audit['tts_engine']['info']}`")
     lines.append(f"{_badge(audit['sqlite_db']['ok'])} **Banco SQLite:** `{audit['sqlite_db']['info']}`")

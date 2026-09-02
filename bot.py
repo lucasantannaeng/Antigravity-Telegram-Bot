@@ -84,6 +84,12 @@ AGY_MODEL = os.getenv("AGY_MODEL", "auto").strip()
 AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT_SECONDS", "600"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+FREE_LLM_API_KEY = (os.getenv("FREE_LLM_API_KEY") or os.getenv("FREELLM_API_KEY") or "").strip()
+FREE_LLM_BASE_URL = (os.getenv("FREE_LLM_BASE_URL") or os.getenv("FREELLM_BASE_URL") or "http://127.0.0.1:31415/v1").rstrip("/")
+os.environ["FREE_LLM_API_KEY"] = FREE_LLM_API_KEY
+os.environ["FREELLM_API_KEY"] = FREE_LLM_API_KEY
+os.environ["FREE_LLM_BASE_URL"] = FREE_LLM_BASE_URL
+os.environ["FREELLM_BASE_URL"] = FREE_LLM_BASE_URL
 TTS_VOICE = os.getenv("TTS_VOICE", "pt-BR-AntonioNeural")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8765"))
 
@@ -102,7 +108,7 @@ TASK_SEMAPHORE = asyncio.Semaphore(2)
 ACTIVE_PROCESSES: Dict[int, asyncio.subprocess.Process] = {}
 PENDING_CONFIRMATIONS: Dict[str, str] = {}
 BOT_START_TIME = time.time()
-METRICS_HTTPD = None
+METRICS_SERVER_TASK = None
 
 
 # ── 2. Logging Setup with 15MB Max Rotation ──────────────────────────────────
@@ -134,10 +140,20 @@ class StateDB:
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-128")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA mmap_size=0")
+        conn.execute("PRAGMA wal_autocheckpoint=10")
         return conn
 
     def _init_db(self):
-        with self._get_conn() as conn:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA wal_autocheckpoint=10")
+            conn.execute("PRAGMA cache_size=-128")
+            conn.execute("PRAGMA mmap_size=0")
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_settings'")
             if cursor.fetchone():
@@ -302,13 +318,28 @@ class StateDB:
 
     def optimize_memory(self):
         try:
-            with self._get_conn() as conn:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
                 conn.execute("PRAGMA shrink_memory")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("PRAGMA optimize")
         except Exception:
             pass
 
 
 db = StateDB(DB_PATH)
+
+
+def trim_process_memory() -> float:
+    """Aggressively trims Python GC garbage, SQLite WAL pages, and Windows working set (<80MB RSS target)."""
+    gc.collect()
+    db.optimize_memory()
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        except Exception:
+            pass
+    proc = psutil.Process(os.getpid())
+    return round(proc.memory_info().rss / (1024 * 1024), 2)
 
 
 # ── 4. Windows Power & Sleep Inhibit ─────────────────────────────────────────
@@ -481,7 +512,7 @@ async def execute_agy_prompt(chat_id: int, topic_id: Optional[int], prompt: str)
     finally:
         ACTIVE_PROCESSES.pop(chat_id, None)
         WindowsPowerLock.release()
-        gc.collect()
+        trim_process_memory()
 
 
 async def execute_hermes_prompt(chat_id: int, prompt: str) -> Tuple[str, bool]:
@@ -520,7 +551,7 @@ async def execute_hermes_prompt(chat_id: int, prompt: str) -> Tuple[str, bool]:
     finally:
         ACTIVE_PROCESSES.pop(chat_id, None)
         WindowsPowerLock.release()
-        gc.collect()
+        trim_process_memory()
 
 
 # ── 8. UI Helpers & Smart Delivery ──────────────────────────────────────────
@@ -888,11 +919,20 @@ async def doctor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🩺 **Executando auditoria completa de saúde nos subsistemas...**", message_thread_id=topic_id, parse_mode=ParseMode.MARKDOWN)
 
     try:
-        audit = await doctor.run_doctor_audit(TELEGRAM_BOT_TOKEN, GROQ_API_KEY, GEMINI_API_KEY, cfg["active_workspace"])
+        audit = await doctor.run_doctor_audit(
+            TELEGRAM_BOT_TOKEN,
+            GROQ_API_KEY,
+            GEMINI_API_KEY,
+            cfg["active_workspace"],
+            freellm_key=FREE_LLM_API_KEY,
+            freellm_base_url=FREE_LLM_BASE_URL
+        )
         report = doctor.format_doctor_report(audit)
         await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await status_msg.edit_text(f"❌ Erro na auditoria do Doctor: `{e}`")
+    finally:
+        trim_process_memory()
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1001,6 +1041,8 @@ async def run_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await reactions.set_message_reaction(context, chat_id, update.message.message_id, "❌")
         await status_msg.edit_text(f"❌ Erro ao executar comando: `{e}`")
+    finally:
+        trim_process_memory()
 
 
 async def cd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1239,9 +1281,8 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stdout, stderr = await res.communicate()
         out_text = stdout.decode("utf-8", errors="replace").strip()
 
-        # Also trigger Python GC and DB trim
-        gc.collect()
-        db.optimize_memory()
+        # Trigger full working set memory trim & SQLite shrink
+        trim_process_memory()
 
         await reactions.set_message_reaction(context, chat_id, update.message.message_id, "👍")
         await status_msg.edit_text(out_text, parse_mode=ParseMode.MARKDOWN)
@@ -1249,6 +1290,8 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Clean command error: {e}")
         await reactions.set_message_reaction(context, chat_id, update.message.message_id, "❌")
         await status_msg.edit_text(f"❌ Erro na otimização: `{e}`")
+    finally:
+        trim_process_memory()
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1449,6 +1492,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 audio_path.unlink()
             except Exception:
                 pass
+        trim_process_memory()
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1486,6 +1530,13 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Photo error: {e}", exc_info=True)
         await reactions.set_message_reaction(context, chat_id, message.message_id, "❌")
         await status_msg.edit_text(f"❌ Erro ao processar imagem: `{e}`")
+    finally:
+        if img_path.exists():
+            try:
+                img_path.unlink()
+            except Exception:
+                pass
+        trim_process_memory()
 
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1523,6 +1574,13 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Doc error: {e}", exc_info=True)
         await reactions.set_message_reaction(context, chat_id, message.message_id, "❌")
         await status_msg.edit_text(f"❌ Erro ao processar documento: `{e}`")
+    finally:
+        if doc_path.exists():
+            try:
+                doc_path.unlink()
+            except Exception:
+                pass
+        trim_process_memory()
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1577,6 +1635,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await progress_task
 
     await send_smart_delivery(chat_id, topic_id, response, context, status_message=status_msg, reply_to_message_id=message.message_id)
+    trim_process_memory()
 
 
 # ── 11. Callbacks Handler ────────────────────────────────────────────────────
@@ -1738,19 +1797,31 @@ async def sentinel_watchdog_loop():
     """Autonomous 24/7 supervisor: trims memory, monitors host health, auto-cleans temp files."""
     logger.info("🛡️ Sentinel Watchdog Loop iniciado.")
     last_auto_clean = time.time()
+    last_routine_trim = time.time()
     while True:
         try:
-            await asyncio.sleep(45.0)
+            await asyncio.sleep(25.0)
 
             proc = psutil.Process(os.getpid())
             rss_mb = proc.memory_info().rss / (1024 * 1024)
-            if rss_mb > 110.0:
-                gc.collect()
-                db.optimize_memory()
-                logger.info(f"Sentinel GC trim: RSS reduced from {round(rss_mb, 1)} MB")
+            now = time.time()
+
+            # Active memory trimmer: if RSS > 65.0 MB or every 2 minutes
+            if rss_mb > 65.0 or (now - last_routine_trim > 120.0):
+                new_rss = trim_process_memory()
+                last_routine_trim = now
+                if rss_mb > 70.0:
+                    logger.info(f"Sentinel memory trim: RSS reduced from {round(rss_mb, 2)} MB to {new_rss} MB")
+
+            # Clean orphaned temporary files older than 10 minutes
+            try:
+                for temp_file in TEMP_DIR.glob("*"):
+                    if temp_file.is_file() and (now - temp_file.stat().st_mtime > 600):
+                        temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
             ram = psutil.virtual_memory()
-            now = time.time()
 
             # Auto-run maintenance script if RAM is low (< 450MB) or every 6 hours
             if (ram.available < (450 * 1024 * 1024) and (now - last_auto_clean > 1800)) or (now - last_auto_clean > 21600):
@@ -1777,6 +1848,7 @@ async def sentinel_watchdog_loop():
 
 async def post_init_setup(application):
     await register_bot_commands(application)
+    trim_process_memory()
     asyncio.create_task(sentinel_watchdog_loop())
     start_metrics_server(METRICS_PORT)
 
