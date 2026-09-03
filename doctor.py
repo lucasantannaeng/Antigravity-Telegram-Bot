@@ -173,7 +173,7 @@ def format_doctor_report(audit: dict) -> str:
     lines.append(f"• **RAM Livre Host:** `{r['host_ram_free']}`")
     lines.append(f"• **Espaço em Disco:** `{r['disk_free']}`")
 
-    all_ok = all(v["ok"] for k, v in audit.items() if isinstance(v, dict) and "ok" in v)
+    all_ok = all(v.get("ok") for v in audit.values() if isinstance(v, dict) and "ok" in v)
     lines.append(f"\n**Veredito:** {'🟢 Todos os subsistemas operacionais e saudáveis!' if all_ok else '⚠️ Alguns subsistemas requerem atenção.'}")
 
     return "\n".join(lines)
