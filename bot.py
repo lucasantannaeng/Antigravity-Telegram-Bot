@@ -329,13 +329,34 @@ class StateDB:
 db = StateDB(DB_PATH)
 
 
+# Win32 Ctypes Strongly Typed Bindings (64-bit Safe)
+if sys.platform == "win32":
+    try:
+        _kernel32 = ctypes.windll.kernel32
+        _psapi = ctypes.windll.psapi
+
+        _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        _psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+        _psapi.EmptyWorkingSet.restype = ctypes.c_int
+
+        _kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
+        _kernel32.SetThreadExecutionState.restype = ctypes.c_uint32
+
+        _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        _kernel32.CreateMutexW.restype = ctypes.c_void_p
+        _kernel32.GetLastError.restype = ctypes.c_uint32
+    except Exception as e:
+        logger.warning(f"Win32 ctypes initialization warning: {e}")
+
+
 def trim_process_memory() -> float:
     """Aggressively trims Python GC garbage, SQLite WAL pages, and Windows working set (<80MB RSS target)."""
     gc.collect()
     db.optimize_memory()
     if sys.platform == "win32":
         try:
-            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+            h_proc = _kernel32.GetCurrentProcess()
+            _psapi.EmptyWorkingSet(h_proc)
         except Exception:
             pass
     proc = psutil.Process(os.getpid())
@@ -354,7 +375,7 @@ class WindowsPowerLock:
     def acquire(cls):
         if sys.platform == "win32":
             try:
-                ctypes.windll.kernel32.SetThreadExecutionState(
+                _kernel32.SetThreadExecutionState(
                     cls.ES_CONTINUOUS | cls.ES_SYSTEM_REQUIRED | cls.ES_AWAYMODE_REQUIRED
                 )
             except Exception:
@@ -364,7 +385,7 @@ class WindowsPowerLock:
     def release(cls):
         if sys.platform == "win32":
             try:
-                ctypes.windll.kernel32.SetThreadExecutionState(cls.ES_CONTINUOUS)
+                _kernel32.SetThreadExecutionState(cls.ES_CONTINUOUS)
             except Exception:
                 pass
 
@@ -409,11 +430,11 @@ async def transcribe_audio(audio_path: Path) -> Optional[str]:
 
 
 async def generate_speech(text: str, out_path: Path) -> bool:
-    """Synthesizes high-definition Portuguese speech using Edge Neural TTS."""
+    """Synthesizes high-definition Portuguese speech using Edge Neural TTS with phonetic sanitization."""
     try:
-        clean_text = formatters.strip_markdown(text)
-        if len(clean_text) > 1000:
-            clean_text = clean_text[:990] + "... (áudio resumido, verifique o texto no chat para mais detalhes)."
+        clean_text = formatters.prepare_text_for_speech(text, max_chars=6000)
+        if not clean_text:
+            return False
 
         communicate = edge_tts.Communicate(clean_text, TTS_VOICE)
         await communicate.save(str(out_path))
@@ -597,7 +618,8 @@ async def send_smart_delivery(
 
     # 1. Handle Huge Outputs (> 3800 chars)
     if len(text) > 3800:
-        preview = text[:1500] + "\n\n*(...relatório completo anexado no arquivo abaixo)*"
+        clean_preview = formatters.sanitize_telegram_markdown(text[:1500])
+        preview = clean_preview + "\n\n*(...relatório completo anexado no arquivo abaixo)*"
         if status_message:
             try:
                 await status_message.edit_text(preview, parse_mode=ParseMode.MARKDOWN)
@@ -621,9 +643,8 @@ async def send_smart_delivery(
             parse_mode=ParseMode.MARKDOWN
         )
     else:
-        # Standard Message Delivery: Convert tables and ensure closed fences
-        formatted_text = formatters.convert_tables_to_cards(text)
-        formatted_text = formatters.ensure_closed_code_blocks(formatted_text)
+        # Standard Message Delivery: Sanitize markdown for Telegram
+        formatted_text = formatters.sanitize_telegram_markdown(text)
 
         delivered = False
         if status_message:
@@ -1353,7 +1374,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _perform_shutdown():
     """Gracefully terminate the bot process after shutdown confirmation."""
     await asyncio.sleep(0.5)
-    raise SystemExit
+    os._exit(0)
 
 
 async def hermes_bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1595,7 +1616,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     text = message.text.strip()
     bot_username = context.bot.username or "Antigravity_lucasantannaeng_bot"
-    topic_id = message.message_thread_id
+    is_private = (chat.type == ChatType.PRIVATE)
+    topic_id = None if is_private else message.message_thread_id
 
     logger.info(f"Recebida mensagem do usuário {user.id} ({user.first_name}) no Chat {chat.id} ({chat.type}): '{text[:60]}'")
 
@@ -1621,21 +1643,52 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat_id = chat.id
-    await reactions.set_message_reaction(context, chat_id, message.message_id, "🤔")
-    status_msg = await message.reply_text("⚡ **Processando...**", message_thread_id=topic_id, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await reactions.set_message_reaction(context, chat_id, message.message_id, "🤔")
+    except Exception:
+        pass
+
+    status_msg = None
+    try:
+        status_msg = await message.reply_text("⚡ **Processando...**", message_thread_id=topic_id, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        try:
+            status_msg = await message.reply_text("⚡ Processando...", message_thread_id=topic_id)
+        except Exception:
+            pass
 
     stop_event = asyncio.Event()
-    progress_task = asyncio.create_task(live_progress_updater(status_msg, stop_event))
+    progress_task = None
+    if status_msg:
+        progress_task = asyncio.create_task(live_progress_updater(status_msg, stop_event))
 
     try:
         response, success = await execute_agy_prompt(chat_id, topic_id, text)
-        await reactions.set_message_reaction(context, chat_id, message.message_id, "👍" if success else "❌")
+        try:
+            await reactions.set_message_reaction(context, chat_id, message.message_id, "👍" if success else "❌")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Erro em execute_agy_prompt: {e}", exc_info=True)
+        response, success = f"❌ **Erro na execução:** `{e}`", False
     finally:
         stop_event.set()
-        await progress_task
+        if progress_task:
+            try:
+                await progress_task
+            except Exception:
+                pass
 
-    await send_smart_delivery(chat_id, topic_id, response, context, status_message=status_msg, reply_to_message_id=message.message_id)
+    try:
+        await send_smart_delivery(chat_id, topic_id, response, context, status_message=status_msg, reply_to_message_id=message.message_id)
+    except Exception as e:
+        logger.error(f"Erro em send_smart_delivery: {e}", exc_info=True)
     trim_process_memory()
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Logs unhandled Telegram errors with full stack trace."""
+    logger.error("Exceção não tratada capturada pelo Telegram error handler:", exc_info=context.error)
 
 
 # ── 11. Callbacks Handler ────────────────────────────────────────────────────
@@ -1861,8 +1914,8 @@ def acquire_singleton_lock(mutex_name: str = "Local\\AntigravityTelegramBot_Sing
     if sys.platform == "win32":
         try:
             ERROR_ALREADY_EXISTS = 183
-            SINGLETON_MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
-            if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            SINGLETON_MUTEX_HANDLE = _kernel32.CreateMutexW(None, True, mutex_name)
+            if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
                 logger.warning("⚠️ Outra instância do Antigravity Telegram Bot já está em execução. Encerrando duplicata silenciosamente.")
                 return False
             return True
@@ -1908,6 +1961,7 @@ def main():
         .post_init(post_init_setup)
         .build()
     )
+    application.add_error_handler(global_error_handler)
 
     # Command Handlers
     application.add_handler(CommandHandler("start", start_command))
