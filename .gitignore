@@ -10,6 +10,7 @@ state.db-wal
 state.db-shm
 *.db
 *.sqlite3
+backups/
 
 # Logs & Metrics
 *.log
