@@ -44,25 +44,33 @@ async def run_doctor_audit(bot_token: str, groq_key: str, gemini_key: str, works
 
     # 2. Antigravity CLI (agy)
     try:
-        res = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=4)
+        res = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=15)
         agy_ver = res.stdout.strip()
         results["antigravity_cli"] = {
             "ok": res.returncode == 0 and len(agy_ver) > 0,
-            "info": f"v{agy_ver}" if res.returncode == 0 else "Erro de execução"
+            "info": f"v{agy_ver}" if res.returncode == 0 else f"Erro de execução (código {res.returncode})"
         }
+    except subprocess.TimeoutExpired:
+        results["antigravity_cli"] = {"ok": False, "info": "Timeout na execução (>15s)"}
+    except FileNotFoundError:
+        results["antigravity_cli"] = {"ok": False, "info": "Binário 'agy' não encontrado no PATH"}
     except Exception as e:
-        results["antigravity_cli"] = {"ok": False, "info": f"Binário não encontrado: {e}"}
+        results["antigravity_cli"] = {"ok": False, "info": f"Erro inesperado: {e}"}
 
     # 3. Hermes Agent
     try:
-        res = subprocess.run(["hermes", "--version"], capture_output=True, text=True, timeout=4)
+        res = subprocess.run(["hermes", "--version"], capture_output=True, text=True, timeout=25)
         hermes_ver = res.stdout.strip().split("\n")[0]
         results["hermes_agent"] = {
             "ok": res.returncode == 0 and len(hermes_ver) > 0,
-            "info": hermes_ver if res.returncode == 0 else "Erro de execução"
+            "info": hermes_ver if res.returncode == 0 else f"Erro de execução (código {res.returncode})"
         }
+    except subprocess.TimeoutExpired:
+        results["hermes_agent"] = {"ok": False, "info": "Timeout na execução (>25s)"}
+    except FileNotFoundError:
+        results["hermes_agent"] = {"ok": False, "info": "Binário 'hermes' não encontrado no PATH"}
     except Exception as e:
-        results["hermes_agent"] = {"ok": False, "info": f"Binário não encontrado: {e}"}
+        results["hermes_agent"] = {"ok": False, "info": f"Erro inesperado: {e}"}
 
     # 4. Audio STT (Groq Whisper)
     if groq_key:
@@ -162,6 +170,8 @@ def format_doctor_report(audit: dict) -> str:
     lines.append(f"{_badge(audit['hermes_agent']['ok'])} **Hermes Agent:** `{audit['hermes_agent']['info']}`")
     if "freellm_proxy" in audit:
         lines.append(f"{_badge(audit['freellm_proxy']['ok'])} **FreeLLM Local Proxy:** `{audit['freellm_proxy']['info']}`")
+    if "daemon_service" in audit:
+        lines.append(f"{_badge(audit['daemon_service']['ok'])} **Daemon Service (:8765):** `{audit['daemon_service']['info']}`")
     lines.append(f"{_badge(audit['stt_engine']['ok'])} **Áudio STT:** `{audit['stt_engine']['info']}`")
     lines.append(f"{_badge(audit['tts_engine']['ok'])} **Áudio TTS:** `{audit['tts_engine']['info']}`")
     lines.append(f"{_badge(audit['sqlite_db']['ok'])} **Banco SQLite:** `{audit['sqlite_db']['info']}`")
@@ -177,3 +187,57 @@ def format_doctor_report(audit: dict) -> str:
     lines.append(f"\n**Veredito:** {'🟢 Todos os subsistemas operacionais e saudáveis!' if all_ok else '⚠️ Alguns subsistemas requerem atenção.'}")
 
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import asyncio
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env")
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    workspace = Path(os.getenv("WORKSPACE_DIR", str(BASE_DIR)))
+    freellm_key = os.getenv("FREE_LLM_API_KEY") or os.getenv("FREELLM_API_KEY", "")
+    freellm_base_url = os.getenv("FREE_LLM_BASE_URL") or os.getenv("FREELLM_BASE_URL", "http://127.0.0.1:31415/v1")
+
+    async def _main():
+        audit = await run_doctor_audit(
+            bot_token=bot_token,
+            groq_key=groq_key,
+            gemini_key=gemini_key,
+            workspace=workspace,
+            freellm_key=freellm_key,
+            freellm_base_url=freellm_base_url
+        )
+
+        # Check local loopback daemon endpoint
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                m_resp = await client.get("http://127.0.0.1:8765/metrics")
+                if m_resp.status_code == 200:
+                    m_data = m_resp.json()
+                    audit["daemon_service"] = {
+                        "ok": True,
+                        "info": f"Online (PID {m_data.get('daemon_pid')}, RSS {m_data.get('daemon_rss_mb')} MB, Uptime {m_data.get('uptime_seconds')}s)"
+                    }
+                else:
+                    audit["daemon_service"] = {"ok": False, "info": f"HTTP {m_resp.status_code}"}
+        except Exception as e:
+            audit["daemon_service"] = {"ok": False, "info": f"Inacessível: {e}"}
+
+        # Check SQLite WAL Checkpoint
+        try:
+            with sqlite3.connect(DB_PATH, timeout=3.0) as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                ckpt = cursor.fetchone()
+                if "sqlite_db" in audit and audit["sqlite_db"]["ok"]:
+                    audit["sqlite_db"]["info"] += f" | WAL: {ckpt}"
+        except Exception as e:
+            pass
+
+        report = format_doctor_report(audit)
+        print(report)
+
+    asyncio.run(_main())

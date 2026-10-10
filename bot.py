@@ -50,6 +50,8 @@ from dotenv import load_dotenv
 import httpx
 import edge_tts
 
+import telegram
+from telegram.error import NetworkError, TelegramError
 from telegram import (
     Update,
     BotCommand,
@@ -81,7 +83,7 @@ ALLOWED_USERS_RAW = os.getenv("TELEGRAM_ALLOWED_USERS", "1366073609")
 DEFAULT_WORKSPACE = Path(os.getenv("WORKSPACE_DIR", r"D:\Projetos")).resolve()
 AGY_PATH = os.getenv("AGY_PATH", "agy")
 AGY_MODEL = os.getenv("AGY_MODEL", "auto").strip()
-AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT_SECONDS", "600"))
+AGY_TIMEOUT = int(os.getenv("AGY_TIMEOUT_SECONDS", "900"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 FREE_LLM_API_KEY = (os.getenv("FREE_LLM_API_KEY") or os.getenv("FREELLM_API_KEY") or "").strip()
@@ -486,13 +488,18 @@ async def execute_agy_prompt(chat_id: int, topic_id: Optional[int], prompt: str)
     mode = cfg.get("agent_mode", "build")
 
     final_prompt = apply_agent_mode_prefix(prompt, mode)
-    cmd = [AGY_PATH, "-p", final_prompt, "--dangerously-skip-permissions"]
+    cmd = [
+        AGY_PATH,
+        "-p", final_prompt,
+        "--dangerously-skip-permissions",
+        "--print-timeout", f"{AGY_TIMEOUT}s"
+    ]
     if is_high_effort:
         cmd.extend(["--effort", "high"])
     if custom_model:
         cmd.extend(["--model", custom_model])
 
-    logger.info(f"Chat {chat_id} executing agy [effort_high={is_high_effort}|mode={mode}] in {workspace}")
+    logger.info(f"Chat {chat_id} executing agy [effort_high={is_high_effort}|mode={mode}|timeout={AGY_TIMEOUT}s] in {workspace}")
     start_t = time.time()
     WindowsPowerLock.acquire()
 
@@ -507,7 +514,7 @@ async def execute_agy_prompt(chat_id: int, topic_id: Optional[int], prompt: str)
             )
             ACTIVE_PROCESSES[chat_id] = process
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=AGY_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=AGY_TIMEOUT + 30)
 
             out_text = stdout.decode("utf-8", errors="replace").strip()
             err_text = stderr.decode("utf-8", errors="replace").strip()
@@ -530,6 +537,65 @@ async def execute_agy_prompt(chat_id: int, topic_id: Optional[int], prompt: str)
     except Exception as e:
         logger.error(f"Execution error: {e}", exc_info=True)
         return f"❌ **Exceção durante execução:** `{e}`", False
+    finally:
+        ACTIVE_PROCESSES.pop(chat_id, None)
+        WindowsPowerLock.release()
+        trim_process_memory()
+
+
+async def execute_agy_continue(chat_id: int, topic_id: Optional[int]) -> Tuple[str, bool]:
+    """Resumes the most recent conversation using agy --continue in the active workspace."""
+    cfg = db.get_settings(chat_id, topic_id)
+    workspace = cfg["active_workspace"]
+    mode = cfg.get("agent_mode", "build")
+
+    prompt = "Continue de onde parou e finalize as tarefas pendentes com precisão."
+    cmd = [
+        AGY_PATH,
+        "--continue",
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--print-timeout", f"{AGY_TIMEOUT}s"
+    ]
+
+    logger.info(f"Chat {chat_id} executing agy continue [timeout={AGY_TIMEOUT}s] in {workspace}")
+    start_t = time.time()
+    WindowsPowerLock.acquire()
+
+    try:
+        async with TASK_SEMAPHORE:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(workspace),
+                env=os.environ.copy()
+            )
+            ACTIVE_PROCESSES[chat_id] = process
+
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=AGY_TIMEOUT + 30)
+
+            out_text = stdout.decode("utf-8", errors="replace").strip()
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+            duration = time.time() - start_t
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+            success = (process.returncode == 0)
+            db.record_metric(chat_id, f"agy_continue_{mode}", duration, success, round(rss_mb, 2), prompt)
+
+            if not success and not out_text:
+                return f"❌ **Erro no Antigravity (`agy --continue`):**\n```\n{err_text or f'Código de saída: {process.returncode}'}\n```", False
+
+            result = out_text if out_text else err_text
+            return result, True
+
+    except asyncio.CancelledError:
+        return "🛑 **Execução cancelada pelo usuário.**", False
+    except asyncio.TimeoutError:
+        return f"⏱️ **Timeout:** Excedeu o limite de {AGY_TIMEOUT} segundos.", False
+    except Exception as e:
+        logger.error(f"Execution continue error: {e}", exc_info=True)
+        return f"❌ **Exceção durante retomada:** `{e}`", False
     finally:
         ACTIVE_PROCESSES.pop(chat_id, None)
         WindowsPowerLock.release()
@@ -578,7 +644,7 @@ async def execute_hermes_prompt(chat_id: int, prompt: str) -> Tuple[str, bool]:
 # ── 8. UI Helpers & Smart Delivery ──────────────────────────────────────────
 
 async def live_progress_updater(message, stop_event: asyncio.Event):
-    """Updates progress message smoothly every 3.5 seconds."""
+    """Updates progress message smoothly every 3.5 seconds with formatted minutes and seconds."""
     start_time = time.time()
     frames = ["⏳", "⚡", "🔍", "⚙️", "✨", "🚀"]
     idx = 0
@@ -590,10 +656,17 @@ async def live_progress_updater(message, stop_event: asyncio.Event):
                 break
 
             elapsed = int(time.time() - start_time)
+            if elapsed < 60:
+                time_str = f"{elapsed}s"
+            else:
+                mins = elapsed // 60
+                secs = elapsed % 60
+                time_str = f"{mins}m {secs:02d}s"
+
             icon = frames[idx % len(frames)]
             idx += 1
             await message.edit_text(
-                f"{icon} **Executando no workspace...** `({elapsed}s)`",
+                f"{icon} **Executando no workspace...** `({time_str})`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
@@ -607,11 +680,18 @@ async def send_smart_delivery(
     context: ContextTypes.DEFAULT_TYPE,
     status_message=None,
     reply_to_message_id: int = None,
-    send_audio_reply: bool = False
+    send_audio_reply: bool = False,
+    reply_markup: Optional[InlineKeyboardMarkup] = None
 ):
-    """Delivers output: text, large file attachment if needed, and optional audio voice response."""
+    """Delivers output: text, large file attachment if needed, interactive buttons, and optional audio voice response."""
     if not text.strip():
         text = "*(Comando concluído com sucesso sem saída textual)*"
+
+    is_partial_timeout = ("agy print timeout after" in text) or ("Returning partial output" in text)
+    if is_partial_timeout and not reply_markup:
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Continuar Execução / Retomar", callback_data="agy_continue:latest")]
+        ])
 
     cfg = db.get_settings(chat_id, topic_id)
     voice_enabled = cfg.get("voice_out_enabled", False) or send_audio_reply
@@ -622,15 +702,16 @@ async def send_smart_delivery(
         preview = clean_preview + "\n\n*(...relatório completo anexado no arquivo abaixo)*"
         if status_message:
             try:
-                await status_message.edit_text(preview, parse_mode=ParseMode.MARKDOWN)
+                await status_message.edit_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
             except Exception:
-                await status_message.edit_text(preview)
+                await status_message.edit_text(preview, reply_markup=reply_markup)
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=topic_id,
                 text=preview,
-                reply_to_message_id=reply_to_message_id
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
             )
 
         file_buf = io.BytesIO(text.encode("utf-8"))
@@ -640,7 +721,8 @@ async def send_smart_delivery(
             message_thread_id=topic_id,
             document=InputFile(file_buf, filename=file_buf.name),
             caption="📄 **Relatório Completo Gerado pelo Antigravity**",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
         )
     else:
         # Standard Message Delivery: Sanitize markdown for Telegram
@@ -649,17 +731,17 @@ async def send_smart_delivery(
         delivered = False
         if status_message:
             try:
-                await status_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+                await status_message.edit_text(formatted_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=reply_markup)
                 delivered = True
             except Exception:
                 try:
                     html_text = formatters.format_telegram_html(text)
-                    await status_message.edit_text(html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    await status_message.edit_text(html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=reply_markup)
                     delivered = True
                 except Exception:
                     try:
                         clean_text = formatters.strip_markdown(text)
-                        await status_message.edit_text(clean_text, disable_web_page_preview=True)
+                        await status_message.edit_text(clean_text, disable_web_page_preview=True, reply_markup=reply_markup)
                         delivered = True
                     except Exception:
                         pass
@@ -672,7 +754,8 @@ async def send_smart_delivery(
                     text=formatted_text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_to_message_id=reply_to_message_id,
-                    disable_web_page_preview=True
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup
                 )
             except Exception:
                 try:
@@ -683,7 +766,8 @@ async def send_smart_delivery(
                         text=html_text,
                         parse_mode=ParseMode.HTML,
                         reply_to_message_id=reply_to_message_id,
-                        disable_web_page_preview=True
+                        disable_web_page_preview=True,
+                        reply_markup=reply_markup
                     )
                 except Exception:
                     clean_text = formatters.strip_markdown(text)
@@ -692,7 +776,8 @@ async def send_smart_delivery(
                         message_thread_id=topic_id,
                         text=clean_text,
                         reply_to_message_id=reply_to_message_id,
-                        disable_web_page_preview=True
+                        disable_web_page_preview=True,
+                        reply_markup=reply_markup
                     )
 
     # 2. Outbound Voice Synthesis (TTS) if enabled
@@ -1687,8 +1772,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Logs unhandled Telegram errors with full stack trace."""
-    logger.error("Exceção não tratada capturada pelo Telegram error handler:", exc_info=context.error)
+    """Logs unhandled Telegram errors. NetworkError is recoverable (the library
+    retries it internally via network_retry_loop), so it gets a one-line warning
+    instead of a 40-line traceback that pollutes the log on every transient blip."""
+    err = context.error
+    if isinstance(err, (NetworkError, TelegramError)) or (err and "httpx" in str(type(err))):
+        logger.warning(f"⚠️ Rede/Telegram transitória ({type(err).__name__}): {err}")
+        return
+    logger.error("Exceção não tratada capturada pelo Telegram error handler:", exc_info=err)
 
 
 # ── 11. Callbacks Handler ────────────────────────────────────────────────────
@@ -1733,6 +1824,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cancel_action":
         await query.edit_message_text("❌ Operação cancelada.")
+
+    elif data == "agy_continue:latest":
+        status_msg = await query.message.reply_text(
+            "🔄 **Retomando execução do Antigravity (`agy --continue`)...**",
+            message_thread_id=topic_id,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(live_progress_updater(status_msg, stop_event))
+        try:
+            response, success = await execute_agy_continue(chat_id, topic_id)
+            try:
+                await reactions.set_message_reaction(context, chat_id, query.message.message_id, "👍" if success else "❌")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Erro em execute_agy_continue: {e}", exc_info=True)
+            response, success = f"❌ **Erro ao continuar:** `{e}`", False
+        finally:
+            stop_event.set()
+            if progress_task:
+                try:
+                    await progress_task
+                except Exception:
+                    pass
+
+        try:
+            await send_smart_delivery(
+                chat_id,
+                topic_id,
+                response,
+                context,
+                status_message=status_msg,
+                reply_to_message_id=query.message.message_id
+            )
+        except Exception as e:
+            logger.error(f"Erro em send_smart_delivery (continue): {e}", exc_info=True)
+        trim_process_memory()
 
     elif data.startswith("shutdown:"):
         confirm_id = data.split("shutdown:", 1)[1]
